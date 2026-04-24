@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -10,7 +11,9 @@ def _build_branch_rgb() -> nn.Module:
     """构建 RGB 语义分支：ResNet-50 去掉 avgpool 和 fc，保留空间特征图。
     输入: (B, 3, 224, 224) → 输出: (B, 2048, 7, 7)
     """
-    resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+    root_dir = Path(__file__).resolve().parent.parent.parent
+    # resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)  # 尝试从服务器下载预训练权重
+    resnet = models.resnet50(weights=str(root_dir / "outputs" / "resnet50" / "resnet50-11ad3fa6.pth"))  # 本地权重
     # children()[:-2] 去掉最后的 AdaptiveAvgPool2d 和 Linear
     modules = list(resnet.children())[:-2]
     return nn.Sequential(*modules)
@@ -65,14 +68,14 @@ class TwoStreamNet(nn.Module):
     """双路特征提取 + 后期融合分类网络。
 
     数据流 (默认配置):
-      RGB     (B,3,224,224) → ResNet-50 → (B,2048,7,7) → GAP → (B,2048)  ─┐
-      Heatmap (B,1,224,224) → GazeCNN  → (B,256,7,7)  → GAP → (B,256)   ─┤
-                                                          Concat → (B,2304)
-                                                    Linear+ReLU → (B,512)
-                                                        Dropout → (B,512)
-                                                         Linear → (B,1)  logits
+      RGB     (B,3,224,224) → ResNet-50 → (B,2048,7,7) → GAP → (B,2048) → Proj → (B,256)  ─┐
+      Heatmap (B,1,224,224) → GazeCNN  → (B,256,7,7)  → GAP → (B,256)                      ─┤
+                                                                  Concat → (B,512)
+                                                            Linear+ReLU → (B,512)
+                                                                Dropout → (B,512)
+                                                                 Linear → (B,1)  logits
 
-    通过 model_cfg 可自定义 gaze_channels、classifier_hidden_dim、dropout。
+    通过 model_cfg 可自定义 gaze_channels、rgb_proj_dim、classifier_hidden_dim、dropout。
     """
 
     RGB_FEAT_DIM = 2048   # ResNet-50 layer4 输出通道数
@@ -83,14 +86,21 @@ class TwoStreamNet(nn.Module):
         gaze_channels = model_cfg.get("gaze_channels", [32, 64, 128, 256, 256])
         hidden_dim = model_cfg.get("classifier_hidden_dim", 512)
         dropout = model_cfg.get("dropout", 0.5)
+        rgb_proj_dim = model_cfg.get("rgb_proj_dim", 256)
 
         self.branch_rgb = _build_branch_rgb()
         self.branch_gaze = GazeCNN(channels=gaze_channels)
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
-        # 融合后的全连接分类头
+        # 将 RGB 特征从 2048 维投影到与热力图分支对等的维度，防止淹没热力图信号
         gaze_feat_dim = self.branch_gaze.out_channels
-        fused_dim = self.RGB_FEAT_DIM + gaze_feat_dim
+        self.rgb_proj = nn.Sequential(
+            nn.Linear(self.RGB_FEAT_DIM, rgb_proj_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        # 融合后的全连接分类头
+        fused_dim = rgb_proj_dim + gaze_feat_dim
         self.classifier = nn.Sequential(
             nn.Linear(fused_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -98,20 +108,20 @@ class TwoStreamNet(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        for m in self.classifier.modules():
+        self._init_classifier()
+
+    def _init_classifier(self):
+        for m in list(self.rgb_proj.modules()) + list(self.classifier.modules()):
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, rgb: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
         """前向传播，输出原始 logits（未经 sigmoid），配合 BCEWithLogitsLoss 使用。"""
-        # RGB 分支: (B,3,H,W) → (B,2048,h,w) → GAP → (B,2048)
         feat_rgb = self.pool(self.branch_rgb(rgb)).flatten(1)
-        # 热力图分支: (B,1,H,W) → (B,C_gaze,h,w) → GAP → (B,C_gaze)
+        feat_rgb = self.rgb_proj(feat_rgb)
         feat_gaze = self.pool(self.branch_gaze(heatmap)).flatten(1)
-        # 特征拼接 + 分类: (B, 2048+C_gaze) → (B, 1)
         fused = torch.cat([feat_rgb, feat_gaze], dim=1)
-        # 分类
         return self.classifier(fused)
 
     def freeze_branch_rgb(self):

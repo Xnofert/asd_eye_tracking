@@ -17,6 +17,7 @@ augmentation:
 # ── 模型超参数 ──
 model:
   gaze_channels: [32, 64, 128, 256, 256]   # GazeCNN 各层输出通道数（共 5 层）
+  rgb_proj_dim: 256                         # RGB 特征投影维度（与热力图分支对等）
   classifier_hidden_dim: 512                # 融合后全连接隐藏层维度
   dropout: 0.5                              # 分类头 Dropout 比率
 

@@ -6,7 +6,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix, roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import GroupKFold
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from src.dataset import ASDDataset, build_sample_list
@@ -67,19 +68,21 @@ class Trainer:
         data_dir = self.data_cfg.get("data_dir", "data")
         self.samples = build_sample_list(data_dir)
         self.labels = [s[2] for s in self.samples]
+        self.groups = [s[3] for s in self.samples]
 
         n_asd = sum(self.labels)
         n_td = len(self.labels) - n_asd
-        print(f"Dataset: {len(self.samples)} samples (ASD={n_asd}, TD={n_td})")
+        n_images = len(set(self.groups))
+        print(f"Dataset: {len(self.samples)} samples (ASD={n_asd}, TD={n_td}), {n_images} unique images")
         print(f"Device: {self.device}")
 
     def run(self) -> list[dict[str, float]]:
-        """执行分层 K 折交叉验证，每折使用全新模型。返回各折最佳验证指标。"""
-        skf = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=self.random_seed)
+        """执行按图像分组的 K 折交叉验证，每折使用全新模型。返回各折最佳验证指标。"""
+        gkf = GroupKFold(n_splits=self.n_folds)
         fold_results = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(
-            skf.split(self.samples, self.labels)
+            gkf.split(self.samples, self.labels, groups=self.groups)
         ):
             print(f"\n{'=' * 60}")
             print(f"Fold {fold_idx + 1}/{self.n_folds}")
@@ -133,18 +136,20 @@ class Trainer:
         # 冻结 ResNet-50，先仅训练 GazeCNN + 分类头
         model.freeze_branch_rgb()
         optimizer = self._make_optimizer(model)
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs - self.freeze_epochs)
 
         best_auc = 0.0
         best_metrics: dict[str, float] = {}
 
         for epoch in range(self.num_epochs):
-            # 到达解冻时机：解冻 ResNet 并重建优化器（确保新参数有干净的动量状态）
             if epoch == self.freeze_epochs:
                 model.unfreeze_branch_rgb()
                 optimizer = self._make_optimizer(model)
+                scheduler = CosineAnnealingLR(optimizer, T_max=self.num_epochs - self.freeze_epochs)
                 print(f"  >> Unfroze RGB branch at epoch {epoch + 1}")
 
             train_loss = self._train_one_epoch(model, train_loader, criterion, optimizer)
+            scheduler.step()
             val_metrics, val_loss = self._evaluate(model, val_loader, criterion)
 
             print(

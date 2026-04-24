@@ -13,7 +13,7 @@ from torchvision.transforms import functional as TF
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
 
 
-def build_sample_list(data_dir: str) -> list[tuple[str, str, int]]:
+def build_sample_list(data_dir: str) -> list[tuple[str, str, int, str]]:
     """扫描 Saliency4ASD 数据集：共享图片目录 + 按类别分开的热力图目录。
 
     目录结构:
@@ -22,6 +22,7 @@ def build_sample_list(data_dir: str) -> list[tuple[str, str, int]]:
       data_dir/TD_FixMaps/{id}_s.png    — TD 组注视热力图
 
     每张图片产生两个样本 (ASD=1, TD=0)，按热力图目录中实际存在的文件配对。
+    返回: [(img_path, hm_path, label, image_id), ...]
     """
     root = Path(data_dir)
     images_dir = root / "Images"
@@ -29,7 +30,7 @@ def build_sample_list(data_dir: str) -> list[tuple[str, str, int]]:
     if not images_dir.is_dir():
         raise FileNotFoundError(f"Missing directory: {images_dir}")
 
-    samples: list[tuple[str, str, int]] = []
+    samples: list[tuple[str, str, int, str]] = []
 
     for class_name, label in [("ASD", 1), ("TD", 0)]:
         heatmaps_dir = root / f"{class_name}_FixMaps"
@@ -48,7 +49,7 @@ def build_sample_list(data_dir: str) -> list[tuple[str, str, int]]:
             hm_path = hm_by_id.get(img_path.stem)
             if hm_path is None:
                 continue
-            samples.append((str(img_path), str(hm_path), label))
+            samples.append((str(img_path), str(hm_path), label, img_path.stem))
 
     return samples
 
@@ -139,7 +140,7 @@ class ASDDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        img_path, hm_path, label = self.samples[idx]
+        img_path, hm_path, label, _image_id = self.samples[idx]
         rgb = Image.open(img_path).convert("RGB")
         heatmap = Image.open(hm_path).convert("L")
         rgb_t, hm_t = self.transform(rgb, heatmap)
